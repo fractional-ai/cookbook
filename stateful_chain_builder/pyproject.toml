@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "stateful-chain-builder"
+version = "0.1.0"
+description = ""
+authors = ["Chris Mullins <chris.mullins@fractional.ai>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+langchain-core = "^0.1.45"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
