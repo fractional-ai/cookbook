@@ -9,6 +9,7 @@ from typing import (
     TypeVar,
     cast,
 )
+from uuid import uuid4
 from langchain.prompts import (
     ChatPromptTemplate,
     MessagesPlaceholder,
@@ -106,6 +107,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         return self._append(
             # cast is safe because we are not actually changing the output type
             runnable=cast(Runnable[RunState, LastOutputType], RunnablePassthrough()),
+            output_field=None,
             history_update_mode=HistoryUpdateMode.CLEAR,
             output_update_mode=OutputUpdateMode.SKIP,
         )
@@ -140,7 +142,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
             messages=self._build_messages(_messages),
             runnable=llm | StrOutputParser(),
             include_history=include_history,
-            output_field=output_field,
+            output_field=output_field or self._get_output_var_name("prompt"),
         )
 
     def structured_prompt(
@@ -182,7 +184,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
             runnable=cast(Runnable[list[BaseMessage], PyT], runnable),
             include_history=include_history,
             append_to_history=append_to_history,
-            output_field=output_field,
+            output_field=output_field or self._get_output_var_name("structured_prompt"),
         )
 
     def branch(
@@ -268,7 +270,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
 
         return self._append(
             runnable=RunnableLambda(_route),
-            output_field=output_field,
+            output_field=output_field or self._get_output_var_name("branch"),
             output_update_mode=OutputUpdateMode.FULL_STATE,
         )
 
@@ -288,7 +290,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         Returns:
             The current builder
         """
-        output_field = output_field or self._get_output_var_name()
+        output_field = output_field or self._get_output_var_name("lambda")
 
         def _lambda_with_output(state: RunState) -> T:
             return _StatefulChainBuilder._call_with_output(_lambda, state)
@@ -383,10 +385,8 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
             ),
         )
 
-    def _get_output_var_name(self):
-        var = f"_output_{self.index}"
-        self.index += 1
-        return var
+    def _get_output_var_name(self, type_prefix: str = "output"):
+        return f"_{self.prefix}_{type_prefix}_{str(uuid4())}"
 
     def _build_messages(
         self, messages: Sequence[MessageLikeRepresentation] | str
@@ -546,12 +546,10 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
     def _append(
         self,
         runnable: Runnable[RunState, T] | Runnable[RunState, Runnable[RunState, RunState]],
+        output_field: str | None,
         history_update_mode: HistoryUpdateMode = HistoryUpdateMode.SKIP,
         output_update_mode: OutputUpdateMode = OutputUpdateMode.LAST_OUTPUT,
-        output_field: str | None = None,
     ) -> "_StatefulChainBuilder[ChainInputType, T]":
-        output_field = output_field or self._get_output_var_name()
-
         result = self.chain | (RunnablePassthrough.assign(**{TMP_OUTPUT_KEY: runnable}))
 
         def _update_history(state: RunState) -> RunState:
@@ -606,6 +604,8 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
                 return state
 
         if output_update_mode != OutputUpdateMode.SKIP:
+            if output_field is None:
+                raise ValueError("Must provide output_field if output_update_mode is not SKIP")
             result = result | _update_output
 
         self.chain = result

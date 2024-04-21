@@ -153,20 +153,32 @@ Example using the run state dictionary:
 
 ```python
 import random
+from dataclasses import dataclass
+
+@dataclass
+class CustomInputType:
+    number: int
 
 builder = (
-    StatefulChainBuilder[dict](ChatOpenAI(model="gpt-3.5-turbo"))
+    StatefulChainBuilder[CustomInputType](ChatOpenAI(model="gpt-3.5-turbo"))
     # inject a random number
     .run_lambda(lambda _: (random.randint(1, 100)))
-    # you can give a custom label to the output of step (it will be given a
-    # random name by default).
     .run_lambda(lambda x: x + 1, output_field="output1")
     # if a lambda with two arguments is given, the second argument will be the
     # RunState dict
-    .run_lambda(lambda x, state: x * state['inputs']['a_random_key'])
+    .run_lambda(lambda x, state: x * state['inputs'].number)
     # output from previous steps can be accessed in the 'outputs' dict
     .run_lambda(lambda x, state: x + state['outputs']['output1'])
 )
 
-builder.run({"a_random_key": 23})
+# you can use `build_raw` to get a chain that outputs the final RunState
+builder.build_raw().invoke(CustomInputType(number=50))
+# > {'inputs': CustomInputType(number=50),
+#    'history': [],
+#    'outputs': {'__lambda_14d6c4e5-abe0-4bcb-af6d-59705dfeec13': 73,
+#     'output1': 74,
+#     '__lambda_0fe3f32d-a14d-4e22-b987-e7627eda6fff': 3700,
+#     '__lambda_89862b0a-940e-42bd-a54f-e08444b3c4ff': 3774},
+#    'last_output_key': '__lambda_89862b0a-940e-42bd-a54f-e08444b3c4ff',
+#    'tmp_output': 3774}
 ```
