@@ -26,7 +26,7 @@ class Recipe(BaseModel):
     steps: list[str]
 
 builder = (
-    StatefulChainBuilder(ChatOpenAI(model="gpt-3.5-turbo"))
+    StatefulChainBuilder[dict](ChatOpenAI(model="gpt-3.5-turbo"))
         .system("""
 Tell me how to cook the provided dish. 
 
@@ -92,7 +92,7 @@ The following will embed the entire history into each prompt, simulating a ChatG
 
 ```python
 builder = (
-    StatefulChainBuilder(ChatOpenAI(model="gpt-3.5-turbo"))
+    StatefulChainBuilder[str](ChatOpenAI(model="gpt-3.5-turbo"))
     .system("You're a friendly assistant")
     .run_lambda(lambda x: {"input": x})
     .prompt(
@@ -126,18 +126,47 @@ passthrough_chain.invoke({"question": "write a sentence about how neat the moon 
 
 ### Calling lambdas
 
-Sometimes you may want to access inputs passed into the chain. With a lambda you can do this as follows:
+The first argument to a lambda passed to `run_lambda` will always be the output of the previous step.
+
+Sometimes you may want to access intermediate outputs or even the original input to the chain.
+
+If you specify a lambda with two arguments, the current state of the run will be passed to the second argument. Run state has the following shape:
+
+```python
+run_state: dict[str, Any] = {
+  # will always contain the original input to the chain, exactly as passed in
+  "inputs": ..., 
+
+  # a dictionary of outputs from all previous steps
+  # unlabeled outputs will have arbitrary prefixes beginning with "_".
+  "outputs": {
+    "_output_1": null
+  },
+
+  # a history of prompts to and responses from LLM calls
+  # note that inputs/outputs to lambdas are NOT logged.
+  "history": [],
+}
+```
+
+Example using the run state dictionary:
 
 ```python
 import random
 
-
 builder = (
-    StatefulChainBuilder(ChatOpenAI(model="gpt-3.5-turbo"))
+    StatefulChainBuilder[dict](ChatOpenAI(model="gpt-3.5-turbo"))
+    # inject a random number
     .run_lambda(lambda _: (random.randint(1, 100)))
-    .run_lambda(lambda x: x + 1)
-    .run_lambda(lambda x, input_number: x * input_number)
+    # you can give a custom label to the output of step (it will be given a
+    # random name by default).
+    .run_lambda(lambda x: x + 1, output_field="output1")
+    # if a lambda with two arguments is given, the second argument will be the
+    # RunState dict
+    .run_lambda(lambda x, state: x * state['inputs']['a_random_key'])
+    # output from previous steps can be accessed in the 'outputs' dict
+    .run_lambda(lambda x, state: x + state['outputs']['output1'])
 )
 
-builder.run(23)
+builder.run({"a_random_key": 23})
 ```
