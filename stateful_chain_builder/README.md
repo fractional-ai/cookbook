@@ -124,6 +124,34 @@ passthrough_chain.invoke({"question": "write a sentence about how neat the moon 
 #   'wordy_answer': 'The moon is a mesmerizing celestial body that never fails to captivate with its beauty and mystery.'}
 ```
 
+### Async iterators
+
+You can use `abatch` to take in an `AsyncIterator` of inputs and emit an `AsyncGenerator` of outputs:
+
+```python
+builder = (
+    StatefulChainBuilder[str](ChatOpenAI(model="gpt-3.5-turbo"))
+    .system("You're a friendly assistant")
+    .run_lambda(lambda x: x + 1)
+)
+
+async def inputs()
+    for i in range(10):
+        yield i
+
+outputs = builder.abatch(inputs())
+
+async for o in outputs:
+    print(o)
+
+# yields:
+#> 8
+#  1
+#  ...
+```
+
+This is useful if you're building a streaming pipeline.
+
 ### Calling lambdas
 
 The first argument to a lambda passed to `run_lambda` will always be the output of the previous step.

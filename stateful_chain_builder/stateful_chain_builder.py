@@ -1,9 +1,12 @@
+import asyncio
 from enum import Enum
 from typing import (
     Any,
+    AsyncIterator,
     Callable,
     Generic,
     Literal,
+    Optional,
     Sequence,
     Type,
     TypeVar,
@@ -21,16 +24,14 @@ from langchain.schema import (
     StrOutputParser,
     SystemMessage,
 )
-from langchain.smith.evaluation.runner_utils import ChatModelInput
-from langchain_core.language_models import BaseChatModel, LanguageModelInput
-from langchain_core.prompt_values import ChatPromptValue
+from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts.chat import MessageLikeRepresentation
 from langchain_core.runnables import (
     Runnable,
     RunnableLambda,
     RunnablePassthrough,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 
 ChainInputType = TypeVar("ChainInputType")
@@ -40,6 +41,9 @@ PyT = TypeVar("PyT", bound=BaseModel)
 
 UndefinedType = Literal["__undefined__"]
 UNDEFINED: UndefinedType = "__undefined__"
+
+SentinelType = Literal["__sentinel__"]
+SENTINEL: SentinelType = "__sentinel__"
 
 OUTPUT_VAR_KEY = "last_output_key"
 OUTPUTS_KEY = "outputs"
@@ -72,6 +76,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
     index: int
     llm: BaseChatModel
     history: ChatPromptTemplate
+    name: str
 
     def __init__(
         self,
@@ -79,6 +84,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         prefix: str = "",
         existing_history: ChatPromptTemplate | None = None,
         initial_state: dict[str, Any] | None = None,
+        name: str | None = None,
     ):
         self.history = ChatPromptTemplate.from_messages(
             existing_history.messages if existing_history else []
@@ -87,6 +93,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         self.index = 0
         self.chain = _StatefulChainBuilder._inject_state(initial_state)
         self.prefix = prefix
+        self.name = name
 
     def system(
         self, message: str
@@ -154,6 +161,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         append_to_history: bool = True,
         llm: BaseChatModel | None = None,
         output_field: str | None = None,
+        fallback_value: Optional[PyT] | UndefinedType = UNDEFINED,
     ) -> "_StatefulChainBuilder[ChainInputType, PyT]":
         """
         Prompt the LLM, asking it to respond with the provided `output_schema`.
@@ -177,6 +185,12 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         runnable: Runnable[list[BaseMessage], dict | BaseModel] = (
             llm.with_structured_output(output_schema)
         )
+
+        if fallback_value != UNDEFINED:
+            runnable = runnable.with_fallbacks(
+                fallbacks=[RunnableLambda(lambda _: fallback_value)],  # type: ignore
+                exceptions_to_handle=(ValidationError,),
+            )
 
         return self._append_with_prompt(
             messages=self._build_messages(_messages),
@@ -223,11 +237,9 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
 
         def _merge_outputs(parent_state: RunState) -> Callable[[RunState], RunState]:
             def _merge(state: RunState) -> RunState:
-                return {
-                    **parent_state,
-                    **state,
-                    OUTPUTS_KEY: {**parent_state[OUTPUTS_KEY], **state[OUTPUTS_KEY]},
-                }
+                parent_state.update(state)
+                parent_state[OUTPUTS_KEY].update(state[OUTPUTS_KEY])
+                return parent_state
 
             return _merge
 
@@ -303,9 +315,77 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
             history_update_mode=HistoryUpdateMode.SKIP,
         )
 
+    def run_passthrough_lambda(
+        self,
+        _lambda: (
+            Callable[[LastOutputType], T] | Callable[[LastOutputType, RunState], T]
+        ),
+        name: str | None = None,
+    ) -> "_StatefulChainBuilder[ChainInputType, LastOutputType]":
+        def _wrap_with_state(state: RunState):
+            return _StatefulChainBuilder._call_with_output(_lambda, state)
+
+        _runnable: Runnable = RunnableLambda(_wrap_with_state, name=name)
+
+        return self._append(
+            runnable=_runnable,
+            output_update_mode=OutputUpdateMode.SKIP,
+            history_update_mode=HistoryUpdateMode.SKIP,
+            output_field=None,
+        )
+
     def run(self, inputs: ChainInputType | None = None) -> LastOutputType:
         output: LastOutputType = self.build().invoke(inputs)
         return output
+
+    async def arun(self, inputs: ChainInputType | None = None) -> LastOutputType:
+        output: LastOutputType = await self.build().ainvoke(inputs)
+        return output
+
+    async def abatch(
+        self,
+        inputs: AsyncIterator[ChainInputType],
+        concurrency: int = 10,
+        filter: Callable[[ChainInputType], Any] | None = None,
+        pass_through_filtered: bool = True,
+    ) -> AsyncIterator[LastOutputType]:
+        queue = asyncio.Queue[ChainInputType | SentinelType](maxsize=concurrency)
+        output_queue = asyncio.Queue[LastOutputType]()
+        done_event = asyncio.Event()
+        active_workers = [True] * concurrency
+        chain = self.build()
+
+        async def _worker(i: int):
+            while True:
+                active_workers[i] = False
+                item = await queue.get()
+                if item == SENTINEL:
+                    break
+                active_workers[i] = True
+                if not filter or filter(item):
+                    output = await chain.ainvoke(item)
+                    await output_queue.put(output)
+                elif pass_through_filtered:
+                    await output_queue.put(cast(LastOutputType, item))
+
+        async def _producer():
+            async for item in inputs:
+                await queue.put(item)
+
+            for _ in range(concurrency):
+                await queue.put(SENTINEL)
+
+            done_event.set()
+
+        workers = [asyncio.create_task(_worker(i)) for i in range(concurrency)]
+        producer = asyncio.create_task(_producer())
+
+        while (
+            any(active_workers) or not output_queue.empty() or not done_event.is_set()
+        ):
+            yield await output_queue.get()
+
+        await asyncio.gather(*workers, producer)
 
     def build(
         self, output_parser: Callable[[RunState], LastOutputType] | None = None
@@ -362,7 +442,8 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         Returns:
             The Runnable object
         """
-        return self.chain
+        name = self.name or self.__class__.__name__
+        return self.chain.with_config(run_name=name)
 
     def with_history(
         self, history: Sequence[MessageLikeRepresentation]
@@ -420,9 +501,10 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         input: dict[str, Any], value: Any, fallback_key: str
     ) -> dict[str, Any]:
         if isinstance(value, dict):
-            return {**input, **value}
+            input.update(value)
         else:
-            return {**input, fallback_key: value}
+            input[fallback_key] = value
+        return input
 
     def _build_part_input(self) -> Runnable[RunState, LastOutputType]:
         def _select_output_field(state: RunState) -> LastOutputType:
@@ -545,7 +627,9 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
 
     def _append(
         self,
-        runnable: Runnable[RunState, T] | Runnable[RunState, Runnable[RunState, RunState]],
+        runnable: (
+            Runnable[RunState, T] | Runnable[RunState, Runnable[RunState, RunState]]
+        ),
         output_field: str | None,
         history_update_mode: HistoryUpdateMode = HistoryUpdateMode.SKIP,
         output_update_mode: OutputUpdateMode = OutputUpdateMode.LAST_OUTPUT,
@@ -554,25 +638,12 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
 
         def _update_history(state: RunState) -> RunState:
             if history_update_mode == HistoryUpdateMode.APPEND:
-                return {
-                    **state,
-                    HISTORY_KEY: [
-                        *state.get(HISTORY_KEY, []),
-                        AIMessage(content=str(state[TMP_OUTPUT_KEY])),
-                    ],
-                }
+                state[HISTORY_KEY].append(AIMessage(content=str(state[TMP_OUTPUT_KEY])))
             elif history_update_mode == HistoryUpdateMode.REPLACE:
-                return {
-                    **state,
-                    HISTORY_KEY: state[TMP_OUTPUT_KEY],
-                }
+                state[HISTORY_KEY] = state[TMP_OUTPUT_KEY]
             elif history_update_mode == HistoryUpdateMode.CLEAR:
-                return {
-                    **state,
-                    HISTORY_KEY: [],
-                }
-            else:
-                return state
+                state[HISTORY_KEY] = []
+            return state
 
         # Skip updating history if replacing output
         if output_update_mode != OutputUpdateMode.FULL_STATE:
@@ -580,37 +651,29 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
 
         def _update_output(state: RunState) -> RunState:
             if output_update_mode == OutputUpdateMode.LAST_OUTPUT:
-                return {
-                    **state,
-                    OUTPUT_VAR_KEY: output_field,
-                    OUTPUTS_KEY: {
-                        **state[OUTPUTS_KEY],
-                        output_field: state[TMP_OUTPUT_KEY],
-                    },
-                }
+                state[OUTPUT_VAR_KEY] = output_field
+                state[OUTPUTS_KEY][output_field] = state[TMP_OUTPUT_KEY]
             elif output_update_mode == OutputUpdateMode.FULL_STATE:
                 new_state = state[TMP_OUTPUT_KEY]
-
-                return {
-                    **new_state,
-                    # patch in the most recent output of the new state as the output of this step
-                    OUTPUT_VAR_KEY: output_field,
-                    OUTPUTS_KEY: {
-                        **new_state[OUTPUTS_KEY],
-                        output_field: new_state[TMP_OUTPUT_KEY],
-                    },
-                }
-            else:
-                return state
+                new_state[OUTPUTS_KEY][output_field] = new_state[OUTPUTS_KEY][
+                    new_state[OUTPUT_VAR_KEY]
+                ]
+                new_state[OUTPUT_VAR_KEY] = output_field
+                new_state[OUTPUTS_KEY].update(state[OUTPUTS_KEY])
+                state = new_state
+            return state
 
         if output_update_mode != OutputUpdateMode.SKIP:
             if output_field is None:
-                raise ValueError("Must provide output_field if output_update_mode is not SKIP")
+                raise ValueError(
+                    "Must provide output_field if output_update_mode is not SKIP"
+                )
             result = result | _update_output
 
         self.chain = result
 
         return cast(_StatefulChainBuilder[ChainInputType, T], self)
+
 
 class StatefulChainBuilder(Generic[T], _StatefulChainBuilder[T, T]):
     pass
