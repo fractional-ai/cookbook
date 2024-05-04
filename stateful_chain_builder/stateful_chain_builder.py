@@ -31,6 +31,7 @@ from langchain_core.runnables import (
     RunnableLambda,
     RunnablePassthrough,
 )
+from langchain_core.runnables.config import RunnableConfig
 from pydantic import BaseModel, ValidationError
 
 
@@ -67,6 +68,62 @@ class OutputUpdateMode(Enum):
     SKIP = "skip"
 
 
+class StepRunnable(Runnable[RunState, RunState]):
+    """Class that manages a single step in a stateful chain."""
+
+    def __init__(
+        self,
+        step: Runnable[RunState, T],
+        output_field: str | None,
+        output_update_mode: OutputUpdateMode,
+        history_update_mode: HistoryUpdateMode,
+    ):
+        """Run a step in a stateful chain."""
+
+        self.step = step
+        self.output_field = output_field
+        self.output_update_mode = output_update_mode
+        self.history_update_mode = history_update_mode
+
+    def invoke(self, state: RunState, config: RunnableConfig | None = None) -> RunState:
+        result = self.step.invoke(state, config)
+        return self._update_state(state, result)
+
+    def _update_state(self, state: RunState, result: T) -> RunState:
+        state[TMP_OUTPUT_KEY] = result
+
+        # Skip updating history if replacing output
+        if self.output_update_mode != OutputUpdateMode.FULL_STATE:
+            if self.history_update_mode == HistoryUpdateMode.APPEND:
+                state[HISTORY_KEY].append(AIMessage(content=str(result)))
+            elif self.history_update_mode == HistoryUpdateMode.REPLACE:
+                state[HISTORY_KEY] = result
+            elif self.history_update_mode == HistoryUpdateMode.CLEAR:
+                state[HISTORY_KEY] = []
+
+        if (
+            self.output_update_mode != OutputUpdateMode.SKIP
+            and self.output_field is None
+        ):
+            raise ValueError(
+                "Must provide output_field if output_update_mode is not SKIP"
+            )
+
+        if self.output_update_mode == OutputUpdateMode.LAST_OUTPUT:
+            state[OUTPUT_VAR_KEY] = self.output_field
+            state[OUTPUTS_KEY][self.output_field] = result
+        elif self.output_update_mode == OutputUpdateMode.FULL_STATE:
+            new_state = cast(RunState, result)
+            new_state[OUTPUTS_KEY][self.output_field] = new_state[OUTPUTS_KEY][
+                new_state[OUTPUT_VAR_KEY]
+            ]
+            new_state[OUTPUT_VAR_KEY] = self.output_field
+            new_state[OUTPUTS_KEY].update(state[OUTPUTS_KEY])
+            state = new_state
+
+        return state
+
+
 class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
     """
     A class for building a chain of stateful operations
@@ -93,7 +150,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         self.index = 0
         self.chain = _StatefulChainBuilder._inject_state(initial_state)
         self.prefix = prefix
-        self.name = name
+        self.name = name or self.__class__.__name__
 
     def system(
         self, message: str
@@ -350,32 +407,39 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         pass_through_filtered: bool = True,
     ) -> AsyncIterator[LastOutputType]:
         queue = asyncio.Queue[ChainInputType | SentinelType](maxsize=concurrency)
-        output_queue = asyncio.Queue[LastOutputType]()
+        output_queue = asyncio.Queue[LastOutputType | SentinelType]()
         done_event = asyncio.Event()
         active_workers = [True] * concurrency
         chain = self.build()
 
         async def _worker(i: int):
-            while True:
+            try:
+                while True:
+                    active_workers[i] = False
+                    item = await queue.get()
+                    if item == SENTINEL:
+                        break
+                    active_workers[i] = True
+                    if not filter or filter(item):
+                        output = await chain.ainvoke(item)
+                        await output_queue.put(output)
+                    elif pass_through_filtered:
+                        await output_queue.put(cast(LastOutputType, item))
+            except:
                 active_workers[i] = False
-                item = await queue.get()
-                if item == SENTINEL:
-                    break
-                active_workers[i] = True
-                if not filter or filter(item):
-                    output = await chain.ainvoke(item)
-                    await output_queue.put(output)
-                elif pass_through_filtered:
-                    await output_queue.put(cast(LastOutputType, item))
+                await output_queue.put(SENTINEL)
+                raise
 
         async def _producer():
-            async for item in inputs:
-                await queue.put(item)
+            try:
+                async for item in inputs:
+                    await queue.put(item)
+            finally:
+                for _ in range(concurrency):
+                    await queue.put(SENTINEL)
 
-            for _ in range(concurrency):
-                await queue.put(SENTINEL)
-
-            done_event.set()
+                await output_queue.put(SENTINEL)
+                done_event.set()
 
         workers = [asyncio.create_task(_worker(i)) for i in range(concurrency)]
         producer = asyncio.create_task(_producer())
@@ -383,7 +447,8 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         while (
             any(active_workers) or not output_queue.empty() or not done_event.is_set()
         ):
-            yield await output_queue.get()
+            if (result := await output_queue.get()) != SENTINEL:
+                yield result
 
         await asyncio.gather(*workers, producer)
 
@@ -442,8 +507,7 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         Returns:
             The Runnable object
         """
-        name = self.name or self.__class__.__name__
-        return self.chain.with_config(run_name=name)
+        return self.chain.with_config(run_name=self.name)
 
     def with_history(
         self, history: Sequence[MessageLikeRepresentation]
@@ -634,44 +698,10 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
         history_update_mode: HistoryUpdateMode = HistoryUpdateMode.SKIP,
         output_update_mode: OutputUpdateMode = OutputUpdateMode.LAST_OUTPUT,
     ) -> "_StatefulChainBuilder[ChainInputType, T]":
-        result = self.chain | (RunnablePassthrough.assign(**{TMP_OUTPUT_KEY: runnable}))
-
-        def _update_history(state: RunState) -> RunState:
-            if history_update_mode == HistoryUpdateMode.APPEND:
-                state[HISTORY_KEY].append(AIMessage(content=str(state[TMP_OUTPUT_KEY])))
-            elif history_update_mode == HistoryUpdateMode.REPLACE:
-                state[HISTORY_KEY] = state[TMP_OUTPUT_KEY]
-            elif history_update_mode == HistoryUpdateMode.CLEAR:
-                state[HISTORY_KEY] = []
-            return state
-
-        # Skip updating history if replacing output
-        if output_update_mode != OutputUpdateMode.FULL_STATE:
-            result = result | _update_history
-
-        def _update_output(state: RunState) -> RunState:
-            if output_update_mode == OutputUpdateMode.LAST_OUTPUT:
-                state[OUTPUT_VAR_KEY] = output_field
-                state[OUTPUTS_KEY][output_field] = state[TMP_OUTPUT_KEY]
-            elif output_update_mode == OutputUpdateMode.FULL_STATE:
-                new_state = state[TMP_OUTPUT_KEY]
-                new_state[OUTPUTS_KEY][output_field] = new_state[OUTPUTS_KEY][
-                    new_state[OUTPUT_VAR_KEY]
-                ]
-                new_state[OUTPUT_VAR_KEY] = output_field
-                new_state[OUTPUTS_KEY].update(state[OUTPUTS_KEY])
-                state = new_state
-            return state
-
-        if output_update_mode != OutputUpdateMode.SKIP:
-            if output_field is None:
-                raise ValueError(
-                    "Must provide output_field if output_update_mode is not SKIP"
-                )
-            result = result | _update_output
-
-        self.chain = result
-
+        step = StepRunnable(
+            runnable, output_field, output_update_mode, history_update_mode
+        )
+        self.chain = self.chain | step
         return cast(_StatefulChainBuilder[ChainInputType, T], self)
 
 
