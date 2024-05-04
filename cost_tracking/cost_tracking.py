@@ -10,14 +10,14 @@ from langchain_core.tracers.context import register_configure_hook
 from collections import defaultdict
 from dataclasses import dataclass
 from langchain_community.callbacks import OpenAICallbackHandler
-from typing import Any
+from typing import Any, AsyncIterator
 from langchain_core.outputs import LLMResult
 
 
-_CALLBACK: ContextVar[OpenAICallbackHandler] = ContextVar(
+_CALLBACK: ContextVar[OpenAICallbackHandler | None] = ContextVar(
     "cost_tracking_callback", default=None
 )
-_CHECKPOINTS: ContextVar[set[str]] = ContextVar("cost_checkpoint", default=None)
+_CHECKPOINTS: ContextVar[set[str] | None] = ContextVar("cost_checkpoint", default=None)
 
 register_configure_hook(_CALLBACK, True)
 
@@ -36,7 +36,7 @@ class OpenAIByModelCostTracker(OpenAICallbackHandler):
 
     def __repr__(self) -> str:
         s = ""
-        total = 0
+        total = 0.0
         for model, tracker in self.model_trackers.items():
             s += f"Model: {model} = {tracker.total_cost}\n"
             total += tracker.total_cost
@@ -46,7 +46,7 @@ class OpenAIByModelCostTracker(OpenAICallbackHandler):
         return s
 
     @property
-    def total_cost(self) -> float:
+    def total_cost(self) -> float:  #  type: ignore
         return sum(tracker.total_cost for tracker in self.model_trackers.values())
 
     def _child_dict(self, child: OpenAICallbackHandler) -> dict[str, Any]:
@@ -106,7 +106,7 @@ def set_cost_checkpoint(checkpoint_name: str):
     try:
         yield
     finally:
-        _CHECKPOINTS.get().remove(checkpoint_name)
+        (_CHECKPOINTS.get() or set()).remove(checkpoint_name)
 
 
 @contextmanager
@@ -129,11 +129,13 @@ async def enforce_budget(budget: float, cb: OpenAIByModelCostTracker):
             if cb.total_cost > budget:
                 done_event.set()
                 sys.stderr.write(
-                    "ERROR: Budget exceeded: ${:.4f}, forcefully shutting down\n".format(
+                    "\n\n!!!!!!!!!!! ERROR: Budget exceeded: ${:.4f}, forcefully shutting down\n\n".format(
                         budget
                     )
                 )
+                sys.stderr.write("------- Cost Breakdown -------\n")
                 sys.stderr.write(str(cb))
+                sys.stderr.write("\n------------------------------\n")
                 os._exit(1)
 
     try:
@@ -149,23 +151,49 @@ async def enforce_budget(budget: float, cb: OpenAIByModelCostTracker):
 
 def cost_checkpoint(checkpoint_name: str):
     def decorator(func):
+        async def _generator_passthrough(
+            g: AsyncIterator, checkpoint_name: str
+        ) -> AsyncIterator:
+            with set_cost_checkpoint(checkpoint_name):
+                async for x in g:
+                    yield x
+
         @functools.wraps(func)
         async def _async_wrapper(*args, **kwargs):
             with set_cost_checkpoint(checkpoint_name):
-                return await func(*args, **kwargs)
+                r = await func(*args, **kwargs)
+
+                # if this is a generator, we need to consume it to track costs
+                if inspect.isasyncgen(r):
+                    return _generator_passthrough(r, checkpoint_name)
+                else:
+                    return r
 
         @functools.wraps(func)
         def _sync_wrapper(*args, **kwargs):
             with set_cost_checkpoint(checkpoint_name):
-                return func(*args, **kwargs)
+                r = func(*args, **kwargs)
+
+                if inspect.isasyncgen(r):
+                    return _generator_passthrough(r, checkpoint_name)
+                else:
+                    return r
 
         @functools.wraps(func)
         def _generator_wrapper(*args, **kwargs):
             with set_cost_checkpoint(checkpoint_name):
                 yield from func(*args, **kwargs)
 
-        if inspect.isgeneratorfunction(func) or inspect.isasyncgenfunction(func):
+        @functools.wraps(func)
+        async def _async_gen_wrapper(*args, **kwargs):
+            with set_cost_checkpoint(checkpoint_name):
+                async for x in func(*args, **kwargs):
+                    yield x
+
+        if inspect.isgeneratorfunction(func):
             return _generator_wrapper
+        elif inspect.isasyncgenfunction(func):
+            return _async_gen_wrapper
         elif asyncio.iscoroutinefunction(func):
             return _async_wrapper
         else:
