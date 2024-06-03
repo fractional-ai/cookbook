@@ -13,3 +13,7 @@ A langchain wrapper useful for:
 * Chain-of-thought prompting with tool use
 * Eas(ier) branching
 * Writing simple type-safe chains
+
+## [Langchain Tracing](./tracing/)
+
+Fine-grained control over which parts of a codebase are traced by Langchain.
