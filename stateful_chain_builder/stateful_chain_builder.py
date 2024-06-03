@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from enum import Enum
 from typing import (
     Any,
@@ -209,6 +210,17 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
             output_field=output_field or self._get_output_var_name("prompt"),
         )
 
+    def add_messages(
+        self,
+        *messages: MessageLikeRepresentation,
+    ) -> "_StatefulChainBuilder[ChainInputType, LastOutputType]":
+        """
+        Add messages to the chat history
+        """
+        return self._update_history(
+            messages=self._build_messages(messages),
+        )
+
     def structured_prompt(
         self,
         output_schema: Type[PyT],
@@ -294,17 +306,21 @@ class _StatefulChainBuilder(Generic[ChainInputType, LastOutputType]):
 
         def _merge_outputs(parent_state: RunState) -> Callable[[RunState], RunState]:
             def _merge(state: RunState) -> RunState:
-                parent_state.update(state)
-                parent_state[OUTPUTS_KEY].update(state[OUTPUTS_KEY])
-                return parent_state
+                return {
+                    **parent_state,
+                    **state,
+                    OUTPUTS_KEY: {
+                        **parent_state[OUTPUTS_KEY],
+                        **state[OUTPUTS_KEY],
+                    },
+                }
 
             return _merge
 
         def _route(state: RunState) -> Runnable[RunState, RunState]:
-            _sub_builder = _StatefulChainBuilder[ChainInputType, T](
-                self.llm, "branch_" + self.prefix, initial_state=state
+            sub_builder = _StatefulChainBuilder[ChainInputType, T](
+                self.llm, "branch_" + self.prefix, initial_state=copy.deepcopy(state)
             )
-            sub_builder = _sub_builder.with_history(state[HISTORY_KEY])
 
             if value_if_true != UNDEFINED:
                 _if_true = lambda b: b.run_lambda(
