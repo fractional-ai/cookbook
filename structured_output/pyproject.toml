@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "structured-output"
+version = "0.1.0"
+description = ""
+authors = ["Chris Mullins <chris.mullins@fractional.ai>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+openai = "^1.40.2"
+pydantic = "^2.8.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
