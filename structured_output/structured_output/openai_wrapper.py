@@ -3,9 +3,13 @@ from typing import TypeVar
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel
-from structured_output.type_helpers import make_openai_compatible, patch_openai_value
+from structured_output.pydantic_helpers import (
+    make_openai_compatible,
+    patch_openai_value,
+)
 
 T = TypeVar("T", bound=BaseModel)
+
 
 def structured_ask(
     client: OpenAI,
@@ -16,7 +20,7 @@ def structured_ask(
     patched_model = make_openai_compatible(response_model)
 
     response = client.beta.chat.completions.parse(
-        messages=messages,  
+        messages=messages,
         response_format=patched_model,
         **kwargs,  # type: ignore
     )
