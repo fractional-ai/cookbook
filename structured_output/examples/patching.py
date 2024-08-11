@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 
-from structured_output.type_helpers import (
+from structured_output.pydantic_helpers import (
     UNKNOWN_PLACEHOLDER,
     make_openai_compatible,
     patch_openai_value,

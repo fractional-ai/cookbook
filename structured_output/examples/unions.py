@@ -1,13 +1,7 @@
 from typing import Literal
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from structured_output.openai_wrapper import structured_ask
-
-from structured_output.type_helpers import (
-    UNKNOWN_PLACEHOLDER,
-    make_openai_compatible,
-    patch_openai_value,
-)
 
 
 class Article(BaseModel):

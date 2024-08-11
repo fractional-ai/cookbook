@@ -1,3 +1,4 @@
+from copy import copy
 from dataclasses import dataclass
 from types import UnionType
 from typing import (
@@ -7,6 +8,7 @@ from typing import (
     Dict,
     List,
     Literal,
+    Sequence,
     Type,
     TypeVar,
     Union,
@@ -86,7 +88,7 @@ def _expand_union(members: tuple[Type[Any]]) -> Type[BaseModel]:
         )
 
     model = create_model(  # type: ignore
-        "UnionModel",
+        "__UnionModel",
         **fields,
         __doc__="Choose one of the options. Fill out 'type' with your choice and the corresponding value.",
     )
@@ -108,14 +110,31 @@ def _unwrap_pydantic_type(model: Type[Any] | None) -> Type[Any]:
     if origin is UnionType or origin is Union:
         # If there's more than one pydantic field, expand the union into a model to ensure
         # compatibility
-        if sum(_is_pydantic(arg) for arg in args) > 1:
+        if sum(_is_pydantic(arg) for arg in args) > 0:
             return _expand_union(args)
-        # # Otherwise, just return the union
+        # Otherwise, just return the union
         else:
             return Union[tuple(_unwrap_pydantic_type(arg) for arg in args)]  # type: ignore
     if _is_pydantic(model):
         return make_openai_compatible(model)
 
+    return copy(model)
+
+
+def _unwrap_annotations(model: Type[Any]) -> tuple[Type[Any], Sequence[Any]]:
+    origin = get_origin(model)
+
+    if origin is Annotated:
+        args = get_args(model)
+        return args[0], args[1:]
+    else:
+        return model, []
+
+
+def _wrap_annotations(model: Type[Any], *annotations: Any) -> Type[Any]:
+    if annotations:
+        for annotation in annotations:
+            model = Annotated[model, annotation]  # type: ignore
     return model
 
 
@@ -148,22 +167,26 @@ def make_openai_compatible(model: Type[BaseModel]) -> Type[BaseModel]:
                     ...,
                     default_factory=None,
                 ),
+                metadata=copy(field.metadata),
             )
 
-            updated_type = Annotated[
+            inner_type, annotations = _unwrap_annotations(updated_type)
+            updated_type = _wrap_annotations(
                 # Allow "unknown" response
-                Union[updated_type, Literal[UNKNOWN_PLACEHOLDER]],  # type: ignore
+                Union[inner_type, Literal[UNKNOWN_PLACEHOLDER]],  # type: ignore
+                *annotations,
                 # keep track of what the default is so we can fill it in later
                 DefaultContainer(value=field.default, factory=field.default_factory),
-            ]  # type: ignore
+            )  # type: ignore
         else:
-            updated_field = field
+            # we still want to create a copy
+            updated_field = FieldInfo.merge_field_infos(Field(), field)
 
         updated_fields[name] = (updated_type, updated_field)
 
-    model = create_model(model.__name__, **updated_fields)  # type: ignore
-
-    return model
+    updated_model = create_model(f"{model.__name__}", **updated_fields)  # type: ignore
+    model.model_rebuild()
+    return updated_model
 
 
 def patch_openai_value(value: T, target_model: type[V]) -> V:
@@ -179,28 +202,43 @@ def patch_openai_value(value: T, target_model: type[V]) -> V:
     union_values: dict[str, Any] = {}
 
     for name, field in value.model_fields.items():
+        had_default = False
+
+        # Check for the default value placeholder and sub in the actual default if it exists
         if getattr(value, name) == UNKNOWN_PLACEHOLDER:
-            for metadata in field.metadata:
-                if isinstance(metadata, DefaultContainer):
-                    setattr(value, name, metadata.get())
-                    break
+            default_container = next(
+                (
+                    metadata
+                    for metadata in field.metadata
+                    if isinstance(metadata, DefaultContainer)
+                ),
+                None,
+            )
+            if default_container:
+                setattr(value, name, default_container.get())
+                had_default = True
 
         # recurse if the field is a pydantic model
         field_value = getattr(value, name)
-        field_model: Type[Any] | None
+        field_model: Type[Any] | None = None
 
-        if union_annotation := next(
-            (
-                metadata
-                for metadata in field.metadata
-                if isinstance(metadata, ExpandedUnion)
-            ),
-            None,
-        ):
-            field_model, field_value = union_annotation.extract_value(field_value)
-            union_values[name] = field_value
-        else:
-            field_model = target_model.model_fields[name].annotation
+        # if default value was set, we don't need to check for further mucking we did with the types
+        # because the default value will be fully valid in the original namespace.
+        if not had_default:
+            union_annotation = next(
+                (
+                    metadata
+                    for metadata in field.metadata
+                    if isinstance(metadata, ExpandedUnion)
+                ),
+                None,
+            )
+            if union_annotation:
+                field_model, field_value = union_annotation.extract_value(field_value)
+                union_values[name] = field_value
+            else:
+                field_model = target_model.model_fields[name].annotation
+
         model_args = get_args(field_model)
 
         if field_model:
@@ -222,11 +260,16 @@ def patch_openai_value(value: T, target_model: type[V]) -> V:
                     },
                 )
 
-    dumped = value.model_dump()
+    # We will have set values in this field which aren't the type it's expecting, so it'll
+    # log warnings. Safe to suppress them since we know the types are compatible.
+    dumped = value.model_dump(warnings=False)
 
     # Target model fields which were expanded unions won't dump the correct value. We want
     # the field to have the value of the union member, not the expanded union model.
     for name, value in union_values.items():
-        dumped[name] = value.model_dump()
+        if isinstance(value, BaseModel):
+            dumped[name] = value.model_dump()
+        else:
+            dumped[name] = value
 
     return target_model.model_validate(dumped)
