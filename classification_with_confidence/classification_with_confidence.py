@@ -2,7 +2,7 @@ from openai import OpenAI
 from enum import Enum
 from typing import TypeVar, Dict, Tuple
 import pydantic
-import numpy as np
+import math
 from openai.types.chat import ParsedChatCompletion, ParsedChoice
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that classifies items into categories. You will be given an item to classify, respond with its category. Respond with the appropriate classification."
@@ -20,7 +20,7 @@ def parse_and_extract_confidence(
 
     # We have the log probability of each token in the classification. Use them to calculate the probability of the classification
     token_logprobs = [logprobs.logprob for logprobs in choice.logprobs.content]
-    probability = np.exp(sum(token_logprobs))
+    probability = math.exp(sum(token_logprobs))
 
     return classification, probability
 
@@ -114,4 +114,4 @@ if __name__ == "__main__":
     #   Science: 53.11%
     #   Sports: 46.87%
     for classification, probability in classifications.items():
-        print(f"{classification.value}: {np.round(probability * 100, 2)}%")
+        print(f"{classification.value}: {round(probability * 100, 2)}%")
