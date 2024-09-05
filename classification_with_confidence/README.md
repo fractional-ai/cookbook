@@ -33,3 +33,22 @@ Suppose we have news article headlines that we want to categorize into one of se
         ArticleType.SPORTS: 0.4687,
       }
     ```
+
+## Options
+There are a few options that can be tweaked to improve results:
+```python
+  classify_with_confidence(
+    "Scientific breakthrough improves football performance",
+    ArticleType,
+    openai_client,
+
+    # Increase/decrease the maximum number of categories returned
+    # In practice OpenAI returns a lot of duplicates, especially when confidence is high, so these 10 might still result in 2 unique categorizations
+    max_categories=10,
+
+    # Must be a model that supports structured output
+    model='gpt-4o-2024-08-06',
+
+    system_prompt="You are an alien who likes to categorize articles but doesn't know about earthling preferences.",
+)
+```
